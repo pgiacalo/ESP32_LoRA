@@ -20,6 +20,8 @@ Here is the wiring diagram between the ESP32 and the LoRA module.
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include <stdlib.h>  // Include for rand() and srand()
+#include <time.h>    // Include for time()
 
 #define UART_NUM UART_NUM_2
 #define TXD_PIN GPIO_NUM_17  // TX pin connected to LoRa RX pin
@@ -90,9 +92,12 @@ void uart_rx_task(void *arg) {
     free(rx_buffer);
 }
 
-// Task to handle LoRa transmitting
+// Task to handle LoRa transmitting with random backoff
 void uart_tx_task(void *arg) {
     char tx_buffer[BUF_SIZE];
+
+    // Seed the random number generator with the receiver_address
+    srand(receiver_address);  // Use receiver_address as the seed
 
     while (1) {
         message_counter++;  // Increment the message counter
@@ -103,11 +108,17 @@ void uart_tx_task(void *arg) {
         snprintf(tx_buffer, BUF_SIZE, "AT+SEND=%d,%d,%s-%d\r\n", receiver_address, 
                  message_length, device_id, message_counter);
         
+        // Random backoff time between 0 and 1000 milliseconds
+        int backoff_time = rand() % 1000;  // Random delay
+        vTaskDelay(pdMS_TO_TICKS(backoff_time));  // Wait for the random backoff time
+
         // Send the command to the LoRa module
         uart_write_bytes(UART_NUM, tx_buffer, strlen(tx_buffer));
         ESP_LOGI(TAG, "Send command sent: %s", tx_buffer);
         
-        // Wait for a short period to allow for response processing
+        // Wait for a short period to allow for any incoming messages
+        vTaskDelay(pdMS_TO_TICKS(100));  // Wait for 100 ms after sending
+
         vTaskDelay(pdMS_TO_TICKS(2000));  // Delay for 2 seconds between messages
     }
 }
