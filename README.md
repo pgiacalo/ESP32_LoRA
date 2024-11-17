@@ -10,8 +10,8 @@ The comments at the top of the code include a wiring diagram showing how to conn
 
 To build, flash and run this code using espressif tools:
 
-cd ESP32_LoRA
-. ~/esp/esp-idf/export.sh
-idf.py -p <usb_port> clean build flash monitor
+cd ESP32_LoRA  
+. ~/esp/esp-idf/export.sh  
+idf.py -p <usb_port> clean build flash monitor  
 
 Once running, the console will print the messages sent and received. 
