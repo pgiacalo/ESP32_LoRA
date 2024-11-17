@@ -1,7 +1,11 @@
 /*
 This is a simple program for 2 ESP32 boards that passes UART messages between them.
-For message transport, LoRA modules are used.
-Here is the wiring diagram between the ESP32 and the LoRA module.
+LoRA modules are used to transmit the messages wirelessly between the two ESP32 boards.
+IMPORTANT: the receiver_address variable must be set to match the ADDRESS of the LoRA device.
+    This is the address assigned to the LoRA device using the AT command AT+ADDRESS=
+    Alternatively, you can set receiver_address = 0. This will send messages to all LoRA devices.
+
+Here is the wiring diagram showing the connections between the ESP32 board and the LoRA module.
 
 	ESP32            LoRA Module
     ----------------------------
@@ -31,7 +35,7 @@ Here is the wiring diagram between the ESP32 and the LoRA module.
 #define BUF_SIZE 1024
 
 // ================================================================================
-static const int receiver_address = 2;  // Set the receiver address (ID)
+static const int receiver_address = 0;  // Set the receiver address (ID)
 // ================================================================================
 
 static const char *TAG = "uart_example";
