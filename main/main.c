@@ -1,152 +1,124 @@
-// Prior to using the LoRA module, connect it to your computer via FTDI/USB.
-// Make sure the FTDI is set for 3.3V and not 5V.
-// Connect the FTDI TX to the LoRa RX, and the FTDI RX to the LoRa TX.
-// Then, open a terminal and connect to the LoRa module at 115200 baud.
-// Then, use the AT+ commands to configure the module (see local file REYAX_LoRa_AT_Command_RYLR998_RYLR498_EN.pdf)
-// Set the ADDRESS, BAND, NETWORKID, MODE, and CPIN
-// For example: AT+ADDRESS=1, AT+BAND=915000000, AT+NETWORKID=10, AT+MODE=0, AT+CPIN=A3F2B8C1
-// Then, load this program onto the ESP32.
-// The ESP32 will send a message, and the other device should receive it.
+/*
+This is a simple program for 2 ESP32 boards that passes UART messages between them.
+For message transport, LoRA modules are used.
+Here is the wiring diagram between the ESP32 and the LoRA module.
+
+	ESP32            LoRA Module
+    ----------------------------
+	GPIO17 (TX) ---> RX pin
+	GPIO16 (RX) <--- TX pin
+    GPIO4 (RST) ---> RST pin
+	GND <----------> GND
+*/
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>  // Include math.h for log10 function
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_system.h"          // For general ESP32 system functions
-#include "esp_mac.h"             // For esp_efuse_mac_get_default()
-#include "esp_chip_info.h"       // For esp_chip_info_t and esp_chip_info()
+#include "esp_random.h"
 
-// LoRa Module Pins
-#define LORA_TX  27  // Connect to RX of LoRa
-#define LORA_RX  19  // Connect to TX of LoRa
-#define LORA_RST 14  // Reset pin
+#define UART_NUM UART_NUM_2
+#define TXD_PIN GPIO_NUM_17  // TX pin connected to LoRa RX pin
+#define RXD_PIN GPIO_NUM_16  // RX pin connected to LoRa TX pin
+#define RST_PIN GPIO_NUM_4    // RST pin connected to LoRa RST pin
+#define UART_BAUD_RATE 9600   // Set the UART baud rate to 9600 for LoRa device
+#define BUF_SIZE 1024
 
-// LoRa Settings
-#define LORA_FREQUENCY    915E6  // 915 MHz
-#define LORA_BANDWIDTH    125E3  // 125 kHz¬
-#define LORA_SPREADING    7      // Spreading Factor
-#define LORA_CODING_RATE 5      // Coding Rate 4/5
+// ================================================================================
+static const int receiver_address = 2;  // Set the receiver address (ID)
+// ================================================================================
 
-// LoRa Registers
-#define REG_FIFO          0x00
-#define REG_OP_MODE       0x01
-#define REG_FR_MSB        0x06
-#define REG_FR_MID        0x07
-#define REG_FR_LSB        0x08
-#define REG_PA_CONFIG     0x09
-#define REG_MODEM_CONFIG1 0x1D
-#define REG_MODEM_CONFIG2 0x1E
-#define REG_MODEM_CONFIG3 0x26
-#define REG_PAYLOAD_LEN   0x22
-
-#define NETWORK_ID 10
-
-static const char *TAG = "LoRa_Device";  
-static const char *name = "Sam";  // Sender name
-static const int receiver_address = 1;  // Receiver address
+static const char *TAG = "uart_example";
+static char device_id[9];  // Store chip ID as string (8 chars + null terminator)
 static int message_counter = 0;  // Counter for incrementing message number
 
-// Function prototype
-void lora_set_frequency(uint32_t frequency);
+// Generate unique device ID once at startup
+void init_device_id(void) {
+    uint32_t id = esp_random();  // Get random number based on hardware
+    sprintf(device_id, "%08lX", (unsigned long)(id & 0xFFFFFFFF));
+    ESP_LOGI(TAG, "Device initialized with ID: %s", device_id);
+}
 
-// Initialize UART for LoRa
-static void lora_init() {
-    // Configure UART
+// Initialize UART
+void uart_init(void) {
     uart_config_t uart_config = {
-        .baud_rate = 115200,  // Ensure this matches on both devices
+        .baud_rate = UART_BAUD_RATE,  // Use the defined baud rate
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
+
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE, BUF_SIZE, 0, NULL, 0));
     
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, LORA_TX, LORA_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 256, 0, NULL, 0));
-    
-    // Reset LoRa Module
-    gpio_set_direction(LORA_RST, GPIO_MODE_OUTPUT);
-    gpio_set_level(LORA_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    gpio_set_level(LORA_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Set the frequency
-    lora_set_frequency(LORA_FREQUENCY);
+    ESP_LOGI(TAG, "UART initialized successfully");
 }
 
-// Function definition
-void lora_set_frequency(uint32_t frequency) {
-    char command[50];
-    snprintf(command, sizeof(command), "AT+FREQ=%lu\r\n", frequency);  // Add CRLF for command termination
-    uart_write_bytes(UART_NUM_1, command, strlen(command));
-    ESP_LOGI(TAG, "Set frequency command sent: %s", command);
-}
-
-// Function to get the unique identifier of the ESP32 chip
-void log_chip_id() {
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
-    ESP_LOGI(TAG, "Chip Info: %d cores, revision %d, %s", 
-              chip_info.cores, chip_info.revision, 
-              (chip_info.features & CHIP_FEATURE_BT) ? "Bluetooth" : "No Bluetooth");
-}
-
-// Function to send a message
-void lora_send_message() {
-    message_counter++;  // Increment the message counter
-    char message[50];  // Buffer for the formatted message
-    char command[100]; // Buffer for the AT command
-
-    // Format the message as "name-counter"
-    snprintf(message, sizeof(message), "%s-%d", name, message_counter);
-    int payload_length = strlen(message);  // Calculate the length of the message
-
-    // Format the command according to the expected syntax
-    snprintf(command, sizeof(command), "AT+SEND=%d,%d,%s\r\n", receiver_address, payload_length, message);
-
-    // Send the command to the LoRa module
-    uart_write_bytes(UART_NUM_1, command, strlen(command));
-    ESP_LOGI(TAG, "Send command sent: %s", command);
-}
-
-// Function to receive a message
-void lora_receive_message() {
-    uint8_t data[128];
-    int length = uart_read_bytes(UART_NUM_1, data, sizeof(data) - 1, pdMS_TO_TICKS(100));
-    if (length > 0) {
-        data[length] = 0;  // Null terminate
-        int received_network_id;
-        char sender_name[20];
-        int counter;
-
-        // Parse the message (assuming format is "networkid-name-counter")
-        if (sscanf((char*)data, "%d-%[^-]-%d", &received_network_id, sender_name, &counter) == 3) {
-            if (received_network_id == NETWORK_ID) {
-                ESP_LOGI(TAG, "Message received: %s", (char*)data);
-            } else {
-                ESP_LOGI(TAG, "Ignored message from different network ID: %d", received_network_id);
-            }
-        }
-    }
-}
-
-void app_main() {
-    lora_init();
+// Task to handle UART receiving
+void uart_rx_task(void *arg) {
+    uint8_t* rx_buffer = (uint8_t*) malloc(BUF_SIZE);
+    int len;
 
     while (1) {
-        lora_send_message();  // Send a message
+        // Read data from UART
+        len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            rx_buffer[len] = 0;  // Null terminate the received data
+            ESP_LOGI(TAG, "Received: %s", rx_buffer);
+
+            // Check for specific responses
+            if (strstr((char*)rx_buffer, "+OK") != NULL) {
+                // Handle +OK response if needed
+                ESP_LOGI(TAG, "Transmission successful.");
+            } else if (strstr((char*)rx_buffer, "+RCV") != NULL) {
+                // Handle incoming message from remote LoRa module
+                ESP_LOGI(TAG, "Remote message received: %s", rx_buffer);
+            } else {
+                // Handle other responses or errors if necessary
+                ESP_LOGE(TAG, "Unexpected response: %s", rx_buffer);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Small delay to prevent busy-waiting
+    }
+    free(rx_buffer);
+}
+
+// Task to handle LoRa transmitting
+void uart_tx_task(void *arg) {
+    char tx_buffer[BUF_SIZE];
+
+    while (1) {
+        message_counter++;  // Increment the message counter
+        
+        // Calculate the length of the message correctly
+        int message_length = strlen(device_id) + 1 + (message_counter < 10 ? 1 : (message_counter < 100 ? 2 : 3)); // +1 for hyphen
+        
+        snprintf(tx_buffer, BUF_SIZE, "AT+SEND=%d,%d,%s-%d\r\n", receiver_address, 
+                 message_length, device_id, message_counter);
+        
+        // Send the command to the LoRa module
+        uart_write_bytes(UART_NUM, tx_buffer, strlen(tx_buffer));
+        ESP_LOGI(TAG, "Send command sent: %s", tx_buffer);
+        
+        // Wait for a short period to allow for response processing
         vTaskDelay(pdMS_TO_TICKS(2000));  // Delay for 2 seconds between messages
-        lora_receive_message();  // Check for received messages
     }
 }
 
-void lora_set_band(int band) {
-    char command[50];
-    snprintf(command, sizeof(command), "AT+BAND=%d\r\n", band);  // Add CRLF for command termination
-    uart_write_bytes(UART_NUM_1, command, strlen(command));
-    ESP_LOGI(TAG, "Set band command sent: %s", command);
+void app_main(void) {
+    // Generate unique ID first
+    init_device_id();
+    
+    // Then initialize UART and tasks
+    uart_init();
+    
+    xTaskCreate(uart_rx_task, "uart_rx_task", 2048, NULL, 5, NULL);
+    xTaskCreate(uart_tx_task, "uart_tx_task", 2048, NULL, 4, NULL);
 }
