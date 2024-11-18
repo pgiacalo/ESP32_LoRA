@@ -26,6 +26,8 @@ Here is the wiring diagram showing the connections between the ESP32 board and t
 #include "esp_random.h"
 #include <stdlib.h>  // Include for rand() and srand()
 #include <time.h>    // Include for time()
+#include <stdint.h>  // Include for uint32_t
+#include <inttypes.h>  // Include for PRIu32
 
 #define UART_NUM UART_NUM_2
 #define TXD_PIN GPIO_NUM_17  // TX pin connected to LoRa RX pin
@@ -153,8 +155,18 @@ void uart_tx_task(void *arg) {
         snprintf(tx_buffer, BUF_SIZE, "AT+SEND=%d,%d,HELLO-%d\r\n", receiver_address, 
                  strlen("HELLO") + 1 + (message_counter < 10 ? 1 : (message_counter < 100 ? 2 : 3)), message_counter);
         
-        // Random backoff time between 0 and 1000 milliseconds
-        int backoff_time = rand() % 1000;  // Random delay
+        // Use esp_random() to generate a random value
+        uint32_t random_value = esp_random();  // Get a random integer
+
+        // Calculate backoff time between 100 and 999 milliseconds
+        int backoff_time = (random_value % 900) + 100;  // Random delay between 100 and 999 milliseconds
+
+        // Check for negative backoff_time (should not happen)
+        if (backoff_time < 0) {
+            ESP_LOGE(TAG, "Backoff time is negative! Flipping to positive.");
+            backoff_time = -backoff_time;  // Flip the sign to positive
+        }
+
         vTaskDelay(pdMS_TO_TICKS(backoff_time));  // Wait for the random backoff time
 
         // Send the command to the LoRa module
@@ -206,5 +218,4 @@ void app_main(void) {
     ESP_LOGI(TAG, "Tasks started");
     ESP_LOGI(TAG, "==================================================");
     vTaskDelay(pdMS_TO_TICKS(2000));  // Wait for 100 ms after UART initialization
-
 }
