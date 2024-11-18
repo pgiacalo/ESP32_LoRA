@@ -1,4 +1,4 @@
-A program that sends and receives wireless (bidirectional) messages between 2 ESP32 boards using LoRA devices.
+A program that sends and receives wireless (bidirectional) messages between 2 ESP32 boards using LoRa devices.
 This c code relies on the esp-idf library and espressif tools only. No Arduino libraries are used or required. 
 
 The wireless communication is NOT 100% reliable, since the wireless signals from the 2 ESP32 boards may 
@@ -6,7 +6,7 @@ be sent simultaneouly and thus interfere with eachother.
 
 A future update to this code will add logic for receiver acknowledgements and transmission resends, if delivery fails.
 
-The comments at the top of the code include a wiring diagram showing how to connect the ESP32 to the LoRA module.
+The comments at the top of the code include a wiring diagram showing how to connect the ESP32 to the LoRa module.
 
 To build, flash and run this code using espressif tools:
 
