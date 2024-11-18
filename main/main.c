@@ -39,14 +39,60 @@ static const int receiver_address = 0;  // Set the receiver address (ID)
 // ================================================================================
 
 static const char *TAG = "uart_example";
-static char device_id[9];  // Store chip ID as string (8 chars + null terminator)
+static char local_lora_device_address[6];  // Buffer to hold the LoRa device address as a string
+static char lora_uid[30];        // Buffer to hold the LoRa UID
 static int message_counter = 0;  // Counter for incrementing message number
 
-// Generate unique device ID once at startup
-void init_device_id(void) {
-    uint32_t id = esp_random();  // Get random number based on hardware
-    sprintf(device_id, "%08lX", (unsigned long)(id & 0xFFFFFFFF));
-    ESP_LOGI(TAG, "Device initialized with ID: %s", device_id);
+// Function to get the LoRa device address
+void get_lora_device_address() {
+    char response[50];  // Buffer to hold the response from the LoRa module
+    // Send the command to get the LoRa device address
+    uart_write_bytes(UART_NUM, "AT+ADDRESS?\r\n", strlen("AT+ADDRESS?\r\n"));
+    
+    // Wait for the response (you may need to adjust the timeout)
+    int len = uart_read_bytes(UART_NUM, response, sizeof(response) - 1, pdMS_TO_TICKS(1000));
+    if (len > 0) {
+        response[len] = '\0';  // Null terminate the received data
+        ESP_LOGI(TAG, "Response received: %s", response);
+
+        // Parse the address from the response
+        char *address_start = strstr(response, "+ADDRESS=");
+        if (address_start) {
+            address_start += 9;  // Move past "+ADDRESS="
+            sscanf(address_start, "%s", local_lora_device_address);  // Extract the LoRa device address
+            ESP_LOGI(TAG, "Local LoRa device address extracted: %s", local_lora_device_address);  // Log the address
+        } else {
+            ESP_LOGE(TAG, "LoRa device address not found in response.");
+        }
+    } else {
+        ESP_LOGE(TAG, "No response received for address command.");
+    }
+}
+
+// Function to get the UID from the LoRa module
+void get_uid_from_lora() {
+    char response[50];  // Buffer to hold the response from the LoRa module
+    // Send the command to get the UID
+    uart_write_bytes(UART_NUM, "AT+UID?\r\n", strlen("AT+UID?\r\n"));
+    
+    // Wait for the response (you may need to adjust the timeout)
+    int len = uart_read_bytes(UART_NUM, response, sizeof(response) - 1, pdMS_TO_TICKS(1000));
+    if (len > 0) {
+        response[len] = '\0';  // Null terminate the received data
+        ESP_LOGI(TAG, "Response received: %s", response);
+
+        // Parse the UID from the response
+        char *uid_start = strstr(response, "+UID=");
+        if (uid_start) {
+            uid_start += 5;  // Move past "+UID="
+            sscanf(uid_start, "%s", lora_uid);  // Extract the LoRa UID
+            ESP_LOGI(TAG, "LoRa UID extracted: %s", lora_uid);  // Log the LoRa UID
+        } else {
+            ESP_LOGE(TAG, "LoRa UID not found in response.");
+        }
+    } else {
+        ESP_LOGE(TAG, "No response received for UID command.");
+    }
 }
 
 // Initialize UART
@@ -100,17 +146,12 @@ void uart_rx_task(void *arg) {
 void uart_tx_task(void *arg) {
     char tx_buffer[BUF_SIZE];
 
-    // Seed the random number generator with the receiver_address
-    srand(receiver_address);  // Use receiver_address as the seed
-
     while (1) {
         message_counter++;  // Increment the message counter
         
-        // Calculate the length of the message correctly
-        int message_length = strlen(device_id) + 1 + (message_counter < 10 ? 1 : (message_counter < 100 ? 2 : 3)); // +1 for hyphen
-        
-        snprintf(tx_buffer, BUF_SIZE, "AT+SEND=%d,%d,%s-%d\r\n", receiver_address, 
-                 message_length, device_id, message_counter);
+        // Construct the message as "HELLO-sequence_number"
+        snprintf(tx_buffer, BUF_SIZE, "AT+SEND=%d,%d,HELLO-%d\r\n", receiver_address, 
+                 strlen("HELLO") + 1 + (message_counter < 10 ? 1 : (message_counter < 100 ? 2 : 3)), message_counter);
         
         // Random backoff time between 0 and 1000 milliseconds
         int backoff_time = rand() % 1000;  // Random delay
@@ -128,12 +169,42 @@ void uart_tx_task(void *arg) {
 }
 
 void app_main(void) {
-    // Generate unique ID first
-    init_device_id();
-    
+    // Get the LoRa device address first
+    ESP_LOGI(TAG, "==================================================");
+
     // Then initialize UART and tasks
+    ESP_LOGI(TAG, "Initializing the UART");
     uart_init();
-    
+    ESP_LOGI(TAG, "UART Initialized");
+
+    ESP_LOGI(TAG, "Getting local LoRa device address");
+    get_lora_device_address();
+    ESP_LOGI(TAG, "Local LoRa Device Address: %s", local_lora_device_address);
+
+    // Example of retry logic for getting the UID
+    ESP_LOGI(TAG, "Getting UID from the local LoRa device");
+    int retries = 3;
+    while (retries > 0) {
+        get_uid_from_lora();
+        if (strlen(lora_uid) > 0) {  // Check if UID was successfully retrieved
+            break;
+        }
+        retries--;
+        vTaskDelay(pdMS_TO_TICKS(100));  // Wait before retrying
+    }
+
+    // Log the LoRa UID and local LoRa device address with framing
+    ESP_LOGI(TAG, "Local LoRa Device UID: %s", lora_uid);
+
+    vTaskDelay(pdMS_TO_TICKS(200));  // Wait for 100 ms after UART initialization
+
+    ESP_LOGI(TAG, "Starting Rx and Tx tasks");
+
     xTaskCreate(uart_rx_task, "uart_rx_task", 2048, NULL, 5, NULL);
     xTaskCreate(uart_tx_task, "uart_tx_task", 2048, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "Tasks started");
+    ESP_LOGI(TAG, "==================================================");
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Wait for 100 ms after UART initialization
+
 }
