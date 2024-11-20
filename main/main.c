@@ -72,6 +72,7 @@ Here is the wiring diagram showing the connections between the ESP32 board and t
 #define RST_PIN GPIO_NUM_4      // RST pin connected to LoRa RST pin
 #define UART_BAUD_RATE 9600     // Set the UART baud rate to 9600 for LoRa device
 #define MAX_DEVICES 8           // Maximum number of devices in the network
+#define STATS_REPORT_INTERVAL 20  // Print statistics every X messages
 
 // ================================================================================
 static const int receiver_address = 0;  // Set the receiver address (ID)
@@ -85,8 +86,25 @@ static int device_number = 0;    // Will be set from LoRa address
 static int tx_offset = 0;        // Will be calculated from device_number
 static bool sync_to_master = false;  // Track if we've synchronized with device 1
 static const int TX_PERIOD = 2000;   // 2 seconds between transmissions
-// Add global variable to track last master message time (i.e., the time a message was last received from Device ID = 1)
 static int64_t last_master_rx_time = 0;
+
+static int last_msg_num[MAX_DEVICES] = {0};  // Track last message number from each device
+static int total_received = 0;
+static int total_dropped = 0;
+
+// Print statistics function
+void print_statistics() {
+    int total_expected = total_received + total_dropped;  // Calculate when needed
+    ESP_LOGI(TAG, "**************************************************");
+    ESP_LOGI(TAG, "Message Statistics:");
+    ESP_LOGI(TAG, "Total Messages Expected: %d", total_expected);
+    ESP_LOGI(TAG, "Total Messages Received: %d", total_received);
+    ESP_LOGI(TAG, "Total Messages Dropped:  %d", total_dropped);
+    if (total_expected > 0) {
+        ESP_LOGI(TAG, "Drop Rate: %.2f%%", (float)total_dropped * 100 / total_expected);
+    }
+    ESP_LOGI(TAG, "**************************************************");
+}
 
 // Function to get the LoRa device address
 void get_lora_device_address() {
@@ -165,13 +183,42 @@ void uart_rx_task(void *arg) {
                 char *id_start = strstr((char*)rx_buffer, "ID");
                 if (id_start) {
                     int sender_id;
-                    if (sscanf(id_start, "ID%d", &sender_id) == 1) {
-                        ESP_LOGI(TAG, "Received message from device ID: %d", sender_id);
+                    int msg_num;
+                    // Parse both ID and message number
+                    if (sscanf(id_start, "ID%d-HELLO-%d", &sender_id, &msg_num) == 2) {
+                        ESP_LOGI(TAG, "Received message from device ID: %d, message number: %d", 
+                                sender_id, msg_num);
                         
-                        // Update timing for any message from master
-                        if (sender_id == 1 && device_number != 1) {
-                            last_master_rx_time = esp_timer_get_time() / 1000; // Convert to ms
+                        // Update message statistics
+                        total_received++;
+                        
+                        // Check for dropped messages
+                        if (last_msg_num[sender_id] > 0) {  // Not first message
+                            int expected_num = last_msg_num[sender_id] + 1;
                             
+                            if (msg_num > expected_num) {
+                                // Current message is higher than expected - messages were dropped
+                                int dropped = msg_num - expected_num;
+                                total_dropped += dropped;
+                                ESP_LOGW(TAG, "Dropped %d messages from device %d (expected %d, got %d)", 
+                                        dropped, sender_id, expected_num, msg_num);
+                            } else if (msg_num < expected_num) {
+                                // Received an older message - this shouldn't happen in normal operation
+                                ESP_LOGW(TAG, "Received out-of-sequence message from device %d (expected %d, got %d)", 
+                                        sender_id, expected_num, msg_num);
+                            }
+                        }
+                        
+                        last_msg_num[sender_id] = msg_num;
+                        
+                        // Print statistics based on configured interval
+                        if (total_received % STATS_REPORT_INTERVAL == 0) {
+                            print_statistics();
+                        }
+                        
+                        // Handle master synchronization
+                        if (sender_id == 1 && device_number != 1) {
+                            last_master_rx_time = esp_timer_get_time() / 1000;
                             if (!sync_to_master) {
                                 ESP_LOGI(TAG, "Initial sync to master device");
                                 sync_to_master = true;
@@ -186,7 +233,6 @@ void uart_rx_task(void *arg) {
     }
 }
 
-// In uart_tx_task, time transmissions relative to last master message
 void uart_tx_task(void *arg) {
     char tx_buffer[MAX_CMD_SIZE];
     char data_buffer[MAX_DATA_SIZE];
@@ -293,4 +339,3 @@ void app_main(void) {
     ESP_LOGI(TAG, "==================================================");
     vTaskDelay(pdMS_TO_TICKS(2000));
 }
-
