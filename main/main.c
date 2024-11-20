@@ -57,6 +57,7 @@ Here is the wiring diagram showing the connections between the ESP32 board and t
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include "esp_timer.h"
 
 // Configuration flags and constants
 #define INCLUDE_OFFSET_IN_MESSAGES false  // Set to true to include offset in messages
@@ -84,6 +85,8 @@ static int device_number = 0;    // Will be set from LoRa address
 static int tx_offset = 0;        // Will be calculated from device_number
 static bool sync_to_master = false;  // Track if we've synchronized with device 1
 static const int TX_PERIOD = 2000;   // 2 seconds between transmissions
+// Add global variable to track last master message time (i.e., the time a message was last received from Device ID = 1)
+static int64_t last_master_rx_time = 0;
 
 // Function to get the LoRa device address
 void get_lora_device_address() {
@@ -149,26 +152,72 @@ void uart_init(void) {
     ESP_LOGI(TAG, "UART initialized successfully");
 }
 
-// Task to handle LoRa transmitting with master/slave synchronization
+void uart_rx_task(void *arg) {
+    uint8_t rx_buffer[BUF_SIZE];
+    int len;
+
+    while (1) {
+        len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(10));
+        if (len > 0) {
+            rx_buffer[len] = 0;
+            
+            if (strstr((char*)rx_buffer, "+RCV") != NULL) {
+                char *id_start = strstr((char*)rx_buffer, "ID");
+                if (id_start) {
+                    int sender_id;
+                    if (sscanf(id_start, "ID%d", &sender_id) == 1) {
+                        ESP_LOGI(TAG, "Received message from device ID: %d", sender_id);
+                        
+                        // Update timing for any message from master
+                        if (sender_id == 1 && device_number != 1) {
+                            last_master_rx_time = esp_timer_get_time() / 1000; // Convert to ms
+                            
+                            if (!sync_to_master) {
+                                ESP_LOGI(TAG, "Initial sync to master device");
+                                sync_to_master = true;
+                            }
+                        }
+                    }
+                }
+            }
+            ESP_LOGI(TAG, "Received: %s", rx_buffer);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// In uart_tx_task, time transmissions relative to last master message
 void uart_tx_task(void *arg) {
     char tx_buffer[MAX_CMD_SIZE];
     char data_buffer[MAX_DATA_SIZE];
     int data_length;
     
     if (device_number == 1) {
-        // Device 1 (master) starts immediately with no delays
-        ESP_LOGI(TAG, "This is master device (ID=1), starting immediately with no offset");
+        ESP_LOGI(TAG, "This is master device (ID=1), starting immediately");
         sync_to_master = true;
-        tx_offset = 0;
     } else {
-        ESP_LOGI(TAG, "Non-master device (ID=%d), waiting for sync from master (ID=1)", device_number);
+        ESP_LOGI(TAG, "Non-master device (ID=%d), waiting for sync", device_number);
     }
 
     while (1) {
         if (sync_to_master || device_number == 1) {
+            if (device_number != 1) {
+                // Calculate time since last master message
+                int64_t current_time = esp_timer_get_time() / 1000;
+                int time_since_master = current_time - last_master_rx_time;
+                
+                // Calculate wait time to reach our offset
+                int wait_time = tx_offset - (time_since_master % TX_PERIOD);
+                if (wait_time < 0) {
+                    wait_time += TX_PERIOD;
+                }
+                
+                vTaskDelay(pdMS_TO_TICKS(wait_time));
+            }
+            
             message_counter++;
             
-            // First construct just the data portion to get its length
+            // Construct message with Device ID embedded
             if (INCLUDE_OFFSET_IN_MESSAGES) {
                 snprintf(data_buffer, MAX_DATA_SIZE, "ID%d-HELLO-%d-OFF%d", 
                         device_number,
@@ -180,17 +229,15 @@ void uart_tx_task(void *arg) {
                         message_counter);
             }
             
-            // Get actual length of data
             data_length = strlen(data_buffer);
             
             // Verify we haven't exceeded LoRa payload size
             if (data_length > MAX_LORA_PAYLOAD) {
-                ESP_LOGE(TAG, "Data exceeds LoRa maximum payload size (%d > %d)!", 
-                         data_length, MAX_LORA_PAYLOAD);
+                ESP_LOGE(TAG, "Data exceeds LoRa maximum payload size!");
                 continue;
             }
             
-            // Now construct full command with correct length
+            // Construct full command
             snprintf(tx_buffer, MAX_CMD_SIZE, "AT+SEND=%d,%d,%s\r\n", 
                     receiver_address,
                     data_length,
@@ -198,63 +245,13 @@ void uart_tx_task(void *arg) {
             
             uart_write_bytes(UART_NUM, tx_buffer, strlen(tx_buffer));
             ESP_LOGI(TAG, "Send command sent: %s", tx_buffer);
-            
-            if (device_number == 1) {
-                // Master device maintains strict timing with no extra delays
-                vTaskDelay(pdMS_TO_TICKS(TX_PERIOD));
-            } else {
-                // Non-master devices include processing delay compensation
-                vTaskDelay(pdMS_TO_TICKS(100));  // Processing delay
-                vTaskDelay(pdMS_TO_TICKS(TX_PERIOD - 100));
-            }
+
+            vTaskDelay(pdMS_TO_TICKS(TX_PERIOD));
         } else {
-            // Not synced yet, keep trying with new random delays
-            int random_delay = esp_random() % 1000;
-            ESP_LOGI(TAG, "Not synced, waiting with random delay: %d ms", random_delay);
-            vTaskDelay(pdMS_TO_TICKS(random_delay));
+            // Not synced yet
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
-}
-
-// Task to handle UART receiving and timing synchronization
-void uart_rx_task(void *arg) {
-    uint8_t* rx_buffer = (uint8_t*) malloc(BUF_SIZE);
-    int len;
-
-    while (1) {
-        len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            rx_buffer[len] = 0;
-            
-            // Check for received message
-            if (strstr((char*)rx_buffer, "+RCV") != NULL) {
-                // Parse the sender's device ID from the message format "IDx-HELLO-y..."
-                char *id_start = strstr((char*)rx_buffer, "ID");
-                if (id_start) {
-                    int sender_id;
-                    if (sscanf(id_start, "ID%d", &sender_id) == 1) {
-                        ESP_LOGI(TAG, "Received message from device ID: %d", sender_id);
-                        
-                        // If this is a message from device 1 and we're not synced
-                        if (sender_id == 1 && !sync_to_master && device_number != 1) {
-                            ESP_LOGI(TAG, "Syncing to master device");
-                            
-                            // Calculate our offset based on our device number
-                            tx_offset = (TX_PERIOD * device_number) / MAX_DEVICES;
-                            
-                            // Mark as synced and start transmitting
-                            sync_to_master = true;
-                            ESP_LOGI(TAG, "Synced to master, using offset: %d ms", tx_offset);
-                        }
-                    }
-                }
-            }
-            
-            ESP_LOGI(TAG, "Received: %s", rx_buffer);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    free(rx_buffer);
 }
 
 void app_main(void) {
