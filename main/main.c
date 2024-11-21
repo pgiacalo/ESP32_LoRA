@@ -111,7 +111,7 @@ void send_message(const char* message) {
     
     // Add CR+LF to the AT command
     snprintf(tx_buffer, sizeof(tx_buffer), "%s\r\n", message);
-    ESP_LOGI(TAG, "Sending: %s", message);
+    ESP_LOGI(TAG, "TX: %s", message);  // Log complete AT command
     uart_write_bytes(UART_PORT, tx_buffer, strlen(tx_buffer));
 }
 
@@ -160,51 +160,81 @@ void calculate_tx_delay(void) {
              tx_delay);
 }
 
-void parse_received_data(const char* data, uint8_t* sender_address, uint16_t* msg_number) {
-    char msg_type[10];
-    sscanf(data, "%[^,],%hhu,%hu", msg_type, sender_address, msg_number);
-}
-
 void process_received_message(const char* message) {
     if (strncmp(message, "+ERR=", 5) == 0) {
         handle_lora_error(message);
         return;
     }
     
+    ESP_LOGI(TAG, "RX: %s", message);  // Log complete received message
+
     uint8_t sender_address;
-    char data[256];
+    int msg_length;
+    char msg_content[256];
     int16_t rssi;
     float snr;
     
-    sscanf(message, "+RCV=%hhu,%*d,%[^,],%hd,%f", 
-           &sender_address, data, &rssi, &snr);
-    
-    uint16_t received_msg_number;
-    parse_received_data(data, &sender_address, &received_msg_number);
-    
-    if (device_stats[sender_address].last_message_number > 0) {
-        uint16_t expected_msg_number = device_stats[sender_address].last_message_number + 1;
-        if (received_msg_number > expected_msg_number) {
-            uint16_t lost_messages = received_msg_number - expected_msg_number;
-            device_stats[sender_address].messages_lost += lost_messages;
-            total_messages_lost += lost_messages;
-        }
+    // Format: +RCV=1,10,HELLO,1,73,-34,11
+    // Parse: sender address, message length
+    if (sscanf(message, "+RCV=%hhu,%d,", &sender_address, &msg_length) != 2) {
+        ESP_LOGW(TAG, "Failed to parse RCV header: %s", message);
+        return;
     }
-    
-    device_stats[sender_address].messages_received++;
-    device_stats[sender_address].last_message_number = received_msg_number;
-    total_messages_received++;
-    
-    ESP_LOGI(TAG, "Received from %d: %s (RSSI: %d, SNR: %.2f)", 
-             sender_address, data, rssi, snr);
-           
-    if ((total_messages_received + total_messages_lost) % STATS_REPORT_INTERVAL == 0) {
-        print_statistics();
+
+    // Find start of message content (after second comma)
+    const char* msg_start = strchr(message + 5, ',');  // Skip "+RCV=" and find first comma
+    if (msg_start) {
+        msg_start = strchr(msg_start + 1, ',');  // Find second comma
+        if (msg_start) {
+            msg_start++;  // Move past the comma
+            
+            // Format inside message content: HELLO,1,73
+            char msg_type[10];
+            uint8_t msg_addr;
+            uint16_t msg_seq;
+            
+            if (sscanf(msg_start, "%[^,],%hhu,%hu,%hd,%f", 
+                      msg_type, &msg_addr, &msg_seq, &rssi, &snr) == 5) {
+                
+                // Verify sender address matches address in message
+                if (sender_address != msg_addr) {
+                    ESP_LOGW(TAG, "Address mismatch: RCV=%d, MSG=%d", sender_address, msg_addr);
+                }
+                
+                // Check for dropped messages
+                if (device_stats[sender_address].last_message_number > 0) {
+                    uint16_t expected_msg_number = device_stats[sender_address].last_message_number + 1;
+                    if (msg_seq > expected_msg_number) {
+                        uint16_t lost_messages = msg_seq - expected_msg_number;
+                        
+                        ESP_LOGW(TAG, "DROPS: addr=%d, last=%d, exp=%d, rcv=%d, lost=%d", 
+                                sender_address,
+                                device_stats[sender_address].last_message_number,
+                                expected_msg_number,
+                                msg_seq,
+                                lost_messages);
+                        
+                        device_stats[sender_address].messages_lost += lost_messages;
+                        total_messages_lost += lost_messages;
+                    }
+                }
+                
+                device_stats[sender_address].messages_received++;
+                device_stats[sender_address].last_message_number = msg_seq;
+                total_messages_received++;
+                           
+                if ((total_messages_received + total_messages_lost) % STATS_REPORT_INTERVAL == 0) {
+                    print_statistics();
+                }
+            } else {
+                ESP_LOGW(TAG, "Failed to parse message content: %s", msg_start);
+            }
+        }
     }
 }
 
 void print_statistics(void) {
-    ESP_LOGI(TAG, "=== Statistics Report ===");
+    ESP_LOGI(TAG, "============= Statistics Report =============");
     ESP_LOGI(TAG, "Messages per device:");
     
     for (int i = 0; i < MAX_DEVICES; i++) {
@@ -225,13 +255,52 @@ void print_statistics(void) {
     ESP_LOGI(TAG, "Total Messages Lost: %u", total_messages_lost);
     ESP_LOGI(TAG, "Total Messages: %u", total_messages);
     ESP_LOGI(TAG, "Drop Percentage: %.2f%%", drop_percentage);
+    ESP_LOGI(TAG, "=============================================");    
 }
 
+bool init_lora(void) {
+    uart_flush(UART_PORT);
+    send_message("AT");
+    
+    // Wait for response
+    char response[64];
+    memset(response, 0, sizeof(response));
+    
+    int len = uart_read_bytes(UART_PORT, (uint8_t*)response, sizeof(response), pdMS_TO_TICKS(1000));
+    if (len > 0) {
+        response[len] = 0;
+        
+        // Remove CR/LF from response if present
+        char* newline = strchr(response, '\r');
+        if (newline) *newline = 0;
+        newline = strchr(response, '\n');
+        if (newline) *newline = 0;
+        
+        if (strcmp(response, "+OK") == 0) {
+            ESP_LOGI(TAG, "LoRa device connection test: successful");
+            return true;
+        } else {
+            ESP_LOGE(TAG, "LoRa device connection test failed. Unexpected response: %s", response);
+            return false;
+        }
+    }
+    
+    ESP_LOGE(TAG, "LoRa device connection test failed. No response received");
+    return false;
+}
 
 void app_main(void) {
     uart_init();
     
     vTaskDelay(pdMS_TO_TICKS(1000));  // Initial delay for LoRa module
+    
+    // Test LoRa connection
+    if (!init_lora()) {
+        while(1) {
+            ESP_LOGE(TAG, "Failed to initialize LoRa device. Halted.");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
     
     get_device_address();
     calculate_tx_delay();
@@ -252,7 +321,6 @@ void app_main(void) {
             snprintf(message, sizeof(message), "AT+SEND=0,%d,%s", payload_len, payload);
             
             send_message(message);
-            ESP_LOGI(TAG, "Master sent SYNC message. Waiting for responses...");
             
             // Check for responses during TX_PERIOD
             uint32_t start_time = pdTICKS_TO_MS(xTaskGetTickCount());
@@ -261,14 +329,13 @@ void app_main(void) {
                                         BUF_SIZE, pdMS_TO_TICKS(10));
                 if (len > 0) {
                     rx_buffer[len] = 0;
-                    ESP_LOGI(TAG, "Master raw data received (%d bytes): %s", len, rx_buffer);
                     
                     if (strncmp(rx_buffer, "+ERR=", 5) == 0) {
                         handle_lora_error(rx_buffer);
                     } else if (strncmp(rx_buffer, "+RCV=", 5) == 0) {
                         process_received_message(rx_buffer);
                     } else if (strncmp(rx_buffer, "+OK", 3) == 0) {
-                        ESP_LOGI(TAG, "Master Send completed successfully");
+                        waiting_for_ok = false;
                     }
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -280,7 +347,6 @@ void app_main(void) {
                                     BUF_SIZE, pdMS_TO_TICKS(100));
             if (len > 0) {
                 rx_buffer[len] = 0;
-                ESP_LOGI(TAG, "Slave received: %s", rx_buffer);
                 
                 if (strncmp(rx_buffer, "+ERR=", 5) == 0) {
                     handle_lora_error(rx_buffer);
@@ -300,11 +366,12 @@ void app_main(void) {
                         snprintf(message, sizeof(message), "AT+SEND=0,%d,%s", payload_len, payload);
                         
                         send_message(message);
-                        ESP_LOGI(TAG, "Sent hello message from slave. Payload length: %d", payload_len);
                         waiting_for_ok = true;
                     }
                 } else if (strncmp(rx_buffer, "+OK", 3) == 0) {
-                    ESP_LOGI(TAG, "Send completed successfully");
+                    waiting_for_ok = false;  // Success, just clear flag
+                } else if (waiting_for_ok) {
+                    ESP_LOGE(TAG, "Unexpected response while waiting for OK: %s", rx_buffer);
                     waiting_for_ok = false;
                 }
             }
