@@ -1,341 +1,314 @@
-/*
-This is a simple program for ESP32 boards that passes UART messages between them.
-LoRa modules are used to transmit the messages wirelessly between ESP32 boards.
-IMPORTANT: the receiver_address variable must be set to match the ADDRESS of the LoRa device.
-    This is the address assigned to the LoRa device using the AT command AT+ADDRESS=
-    Alternatively, you can set receiver_address = 0. This will send messages to all LoRa devices.
-
-This version implements a master/slave timing synchronization where:
-- Device ID 1 is the master and establishes timing reference
-- Other devices sync to Device 1's transmissions
-- Each device uses an offset based on its ID to avoid collisions
-- Non-master devices use continuous random delays until first sync with master
-
-Message Format Configuration:
-----------------------------
-Set INCLUDE_OFFSET_IN_MESSAGES below to control message format:
-
-If INCLUDE_OFFSET_IN_MESSAGES is true:
-    Format: "IDx-HELLO-y-OFFz"
-    where: x = device ID (1=master)
-           y = message counter
-           z = tx_offset in ms
-    Example from master: "ID1-HELLO-42-OFF0"
-    Example from device 2: "ID2-HELLO-17-OFF500"
-
-If INCLUDE_OFFSET_IN_MESSAGES is false:
-    Format: "IDx-HELLO-y"
-    where: x = device ID (1=master)
-           y = message counter
-    Example from master: "ID1-HELLO-42"
-    Example from device 2: "ID2-HELLO-17"
-
-Note: Per LoRa specification, maximum payload size is 255 bytes.
-      The AT command format is: AT+SEND=<address>,<length>,<data>
-      Example: AT+SEND=50,5,HELLO  (where 5 is the length of "HELLO")
-
-Here is the wiring diagram showing the connections between the ESP32 board and the LoRa module.
-
-    ESP32            LoRa Module
-    ----------------------------
-    GPIO17 (TX) ---> RX pin
-    GPIO16 (RX) <--- TX pin
-    GPIO4 (RST) ---> RST pin
-    GND <----------> GND
-*/
-
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_random.h"
-#include <stdlib.h>
-#include <time.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include "esp_timer.h"
 
-// Configuration flags and constants
-#define INCLUDE_OFFSET_IN_MESSAGES false  // Set to true to include offset in messages
-#define MAX_LORA_PAYLOAD 255    // LoRa specification maximum payload size
-#define MAX_DATA_SIZE 255       // Match LoRa max payload
-#define MAX_CMD_SIZE 280        // Enough for "AT+SEND=xxx,255,<255 bytes>\r\n"
-#define BUF_SIZE 1024          // Buffer size for UART operations
-#define TASK_STACK_SIZE 4096   // Increased stack size for tasks
-#define UART_NUM UART_NUM_2
-#define TXD_PIN GPIO_NUM_17     // TX pin connected to LoRa RX pin
-#define RXD_PIN GPIO_NUM_16     // RX pin connected to LoRa TX pin
-#define RST_PIN GPIO_NUM_4      // RST pin connected to LoRa RST pin
-#define UART_BAUD_RATE 9600     // Set the UART baud rate to 9600 for LoRa device
-#define MAX_DEVICES 8           // Maximum number of devices in the network
-#define STATS_REPORT_INTERVAL 20  // Print statistics every X messages
+static const char *TAG = "LoRa";
 
-// ================================================================================
-static const int receiver_address = 0;  // Set the receiver address (ID)
-// ================================================================================
+// Pin definitions
+#define TXD_PIN GPIO_NUM_17
+#define RXD_PIN GPIO_NUM_16
+#define RST_PIN GPIO_NUM_4
 
-static const char *TAG = "uart_example";
-static char local_lora_device_address[6];  // Buffer to hold the LoRa device address as a string
-static char lora_uid[30];        // Buffer to hold the LoRa UID
-static int message_counter = 0;  // Counter for incrementing message number
-static int device_number = 0;    // Will be set from LoRa address
-static int tx_offset = 0;        // Will be calculated from device_number
-static bool sync_to_master = false;  // Track if we've synchronized with device 1
-static const int TX_PERIOD = 2000;   // 2 seconds between transmissions
-static int64_t last_master_rx_time = 0;
+// UART configurations
+#define UART_PORT UART_NUM_2
+#define UART_BAUD_RATE 9600
+#define BUF_SIZE 1024
 
-static int last_msg_num[MAX_DEVICES] = {0};  // Track last message number from each device
-static int total_received = 0;
-static int total_dropped = 0;
+// Application configurations
+#define MASTER_ADDRESS 0    //the master LoRa device MUST have address 0
+#define NUMBER_OF_SLAVES 1
+#define TX_PERIOD 4000  // milliseconds
+#define MAX_DEVICES 256
+#define STATS_REPORT_INTERVAL 100   //the total number of messages between statistics reports
 
-// Print statistics function
-void print_statistics() {
-    int total_expected = total_received + total_dropped;  // Calculate when needed
-    ESP_LOGI(TAG, "**************************************************");
-    ESP_LOGI(TAG, "Message Statistics:");
-    ESP_LOGI(TAG, "Total Messages Expected: %d", total_expected);
-    ESP_LOGI(TAG, "Total Messages Received: %d", total_received);
-    ESP_LOGI(TAG, "Total Messages Dropped:  %d", total_dropped);
-    if (total_expected > 0) {
-        ESP_LOGI(TAG, "Drop Rate: %.2f%%", (float)total_dropped * 100 / total_expected);
-    }
-    ESP_LOGI(TAG, "**************************************************");
-}
+// Function prototypes
+void uart_init(void);
+void get_device_address(void);
+void calculate_tx_delay(void);
+void send_message(const char* message);
+void process_received_message(const char* message);
+void parse_received_data(const char* data, uint8_t* sender_address, uint16_t* msg_number);
+void handle_lora_error(const char* response);
+void print_statistics(void);  // Added this prototype
 
-// Function to get the LoRa device address
-void get_lora_device_address() {
-    char response[50];
-    uart_write_bytes(UART_NUM, "AT+ADDRESS?\r\n", strlen("AT+ADDRESS?\r\n"));
-    
-    int len = uart_read_bytes(UART_NUM, response, sizeof(response) - 1, pdMS_TO_TICKS(1000));
-    if (len > 0) {
-        response[len] = '\0';
-        ESP_LOGI(TAG, "Response received: %s", response);
 
-        char *address_start = strstr(response, "+ADDRESS=");
-        if (address_start) {
-            address_start += 9;
-            sscanf(address_start, "%s", local_lora_device_address);
-            ESP_LOGI(TAG, "Local LoRa device address extracted: %s", local_lora_device_address);
-        } else {
-            ESP_LOGE(TAG, "LoRa device address not found in response.");
-        }
-    } else {
-        ESP_LOGE(TAG, "No response received for address command.");
-    }
-}
+// Message tracking structure for each device
+typedef struct {
+    uint16_t messages_received;
+    uint16_t messages_lost;
+    uint16_t last_message_number;
+} DeviceStats;
 
-// Function to get the UID from the LoRa module
-void get_uid_from_lora() {
-    char response[50];
-    uart_write_bytes(UART_NUM, "AT+UID?\r\n", strlen("AT+UID?\r\n"));
-    
-    int len = uart_read_bytes(UART_NUM, response, sizeof(response) - 1, pdMS_TO_TICKS(1000));
-    if (len > 0) {
-        response[len] = '\0';
-        ESP_LOGI(TAG, "Response received: %s", response);
+// Error mapping structure
+typedef struct {
+    uint8_t code;
+    const char* description;
+} LoRaError;
 
-        char *uid_start = strstr(response, "+UID=");
-        if (uid_start) {
-            uid_start += 5;
-            sscanf(uid_start, "%s", lora_uid);
-            ESP_LOGI(TAG, "LoRa UID extracted: %s", lora_uid);
-        } else {
-            ESP_LOGE(TAG, "LoRa UID not found in response.");
-        }
-    } else {
-        ESP_LOGE(TAG, "No response received for UID command.");
-    }
-}
+// Error code to description mapping
+static const LoRaError LORA_ERRORS[] = {
+    {1, "No CR/LF (0x0D 0x0A) at end of AT Command"},
+    {2, "AT command header missing"},
+    {4, "Unknown command"},
+    {5, "Data length mismatch with actual length"},
+    {10, "TX timeout exceeded"},
+    {12, "CRC error"},
+    {13, "TX data exceeds 240 bytes"},
+    {14, "Failed to write flash memory"},
+    {15, "Unknown failure"},
+    {17, "Last TX was not completed"},
+    {18, "Preamble value not allowed"},
+    {19, "RX failed - Header error"},
+    {20, "Invalid smart receiving power saving mode time setting"}
+};
 
-// Initialize UART
+static const int NUM_LORA_ERRORS = sizeof(LORA_ERRORS) / sizeof(LoRaError);
+
+// Global variables
+uint8_t device_address;
+uint16_t message_number = 1;
+uint16_t tx_delay;
+DeviceStats device_stats[MAX_DEVICES];
+uint16_t total_messages_received = 0;
+uint16_t total_messages_lost = 0;
+
 void uart_init(void) {
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
+        .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
-
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE, BUF_SIZE, 0, NULL, 0));
     
-    ESP_LOGI(TAG, "UART initialized successfully");
+    uart_param_config(UART_PORT, &uart_config);
+    uart_set_pin(UART_PORT, TXD_PIN, RXD_PIN, RST_PIN, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_PORT, BUF_SIZE, BUF_SIZE, 0, NULL, 0);
 }
 
-void uart_rx_task(void *arg) {
-    uint8_t rx_buffer[BUF_SIZE];
-    int len;
-
-    while (1) {
-        len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(10));
-        if (len > 0) {
-            rx_buffer[len] = 0;
-            
-            if (strstr((char*)rx_buffer, "+RCV") != NULL) {
-                char *id_start = strstr((char*)rx_buffer, "ID");
-                if (id_start) {
-                    int sender_id;
-                    int msg_num;
-                    // Parse both ID and message number
-                    if (sscanf(id_start, "ID%d-HELLO-%d", &sender_id, &msg_num) == 2) {
-                        ESP_LOGI(TAG, "Received message from device ID: %d, message number: %d", 
-                                sender_id, msg_num);
-                        
-                        // Update message statistics
-                        total_received++;
-                        
-                        // Check for dropped messages
-                        if (last_msg_num[sender_id] > 0) {  // Not first message
-                            int expected_num = last_msg_num[sender_id] + 1;
-                            
-                            if (msg_num > expected_num) {
-                                // Current message is higher than expected - messages were dropped
-                                int dropped = msg_num - expected_num;
-                                total_dropped += dropped;
-                                ESP_LOGW(TAG, "Dropped %d messages from device %d (expected %d, got %d)", 
-                                        dropped, sender_id, expected_num, msg_num);
-                            } else if (msg_num < expected_num) {
-                                // Received an older message - this shouldn't happen in normal operation
-                                ESP_LOGW(TAG, "Received out-of-sequence message from device %d (expected %d, got %d)", 
-                                        sender_id, expected_num, msg_num);
-                            }
-                        }
-                        
-                        last_msg_num[sender_id] = msg_num;
-                        
-                        // Print statistics based on configured interval
-                        if (total_received % STATS_REPORT_INTERVAL == 0) {
-                            print_statistics();
-                        }
-                        
-                        // Handle master synchronization
-                        if (sender_id == 1 && device_number != 1) {
-                            last_master_rx_time = esp_timer_get_time() / 1000;
-                            if (!sync_to_master) {
-                                ESP_LOGI(TAG, "Initial sync to master device");
-                                sync_to_master = true;
-                            }
-                        }
-                    }
-                }
+void handle_lora_error(const char* response) {
+    uint8_t error_code;
+    if (sscanf(response, "+ERR=%hhu", &error_code) == 1) {
+        const char* error_description = "Undefined error";
+        
+        for (int i = 0; i < NUM_LORA_ERRORS; i++) {
+            if (LORA_ERRORS[i].code == error_code) {
+                error_description = LORA_ERRORS[i].description;
+                break;
             }
-            ESP_LOGI(TAG, "Received: %s", rx_buffer);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        
+        ESP_LOGE(TAG, "Error Code %d - %s", error_code, error_description);
     }
 }
 
-void uart_tx_task(void *arg) {
-    char tx_buffer[MAX_CMD_SIZE];
-    char data_buffer[MAX_DATA_SIZE];
-    int data_length;
+void send_message(const char* message) {
+    char tx_buffer[256];
     
-    if (device_number == 1) {
-        ESP_LOGI(TAG, "This is master device (ID=1), starting immediately");
-        sync_to_master = true;
-    } else {
-        ESP_LOGI(TAG, "Non-master device (ID=%d), waiting for sync", device_number);
-    }
+    // Add CR+LF to the AT command
+    snprintf(tx_buffer, sizeof(tx_buffer), "%s\r\n", message);
+    ESP_LOGI(TAG, "Sending: %s", message);
+    uart_write_bytes(UART_PORT, tx_buffer, strlen(tx_buffer));
+}
 
-    while (1) {
-        if (sync_to_master || device_number == 1) {
-            if (device_number != 1) {
-                // Calculate time since last master message
-                int64_t current_time = esp_timer_get_time() / 1000;
-                int time_since_master = current_time - last_master_rx_time;
-                
-                // Calculate wait time to reach our offset
-                int wait_time = tx_offset - (time_since_master % TX_PERIOD);
-                if (wait_time < 0) {
-                    wait_time += TX_PERIOD;
-                }
-                
-                vTaskDelay(pdMS_TO_TICKS(wait_time));
-            }
-            
-            message_counter++;
-            
-            // Construct message with Device ID embedded
-            if (INCLUDE_OFFSET_IN_MESSAGES) {
-                snprintf(data_buffer, MAX_DATA_SIZE, "ID%d-HELLO-%d-OFF%d", 
-                        device_number,
-                        message_counter,
-                        tx_offset);
-            } else {
-                snprintf(data_buffer, MAX_DATA_SIZE, "ID%d-HELLO-%d", 
-                        device_number,
-                        message_counter);
-            }
-            
-            data_length = strlen(data_buffer);
-            
-            // Verify we haven't exceeded LoRa payload size
-            if (data_length > MAX_LORA_PAYLOAD) {
-                ESP_LOGE(TAG, "Data exceeds LoRa maximum payload size!");
-                continue;
-            }
-            
-            // Construct full command
-            snprintf(tx_buffer, MAX_CMD_SIZE, "AT+SEND=%d,%d,%s\r\n", 
-                    receiver_address,
-                    data_length,
-                    data_buffer);
-            
-            uart_write_bytes(UART_NUM, tx_buffer, strlen(tx_buffer));
-            ESP_LOGI(TAG, "Send command sent: %s", tx_buffer);
-
-            vTaskDelay(pdMS_TO_TICKS(TX_PERIOD));
+void get_device_address(void) {
+    // Send the address query command
+    uart_flush(UART_PORT);
+    send_message("AT+ADDRESS?");
+    
+    // Now we need to wait for and read the response ourselves since send_message no longer does it
+    char response[64];
+    memset(response, 0, sizeof(response));
+    
+    int len = uart_read_bytes(UART_PORT, (uint8_t*)response, sizeof(response), pdMS_TO_TICKS(1000));
+    if (len > 0) {
+        response[len] = 0;
+        ESP_LOGI(TAG, "Address Response: %s", response);
+        
+        // Remove CR/LF from response if present
+        char* newline = strchr(response, '\r');
+        if (newline) *newline = 0;
+        newline = strchr(response, '\n');
+        if (newline) *newline = 0;
+        
+        if (sscanf(response, "+ADDRESS=%hhu", &device_address) == 1) {
+            ESP_LOGI(TAG, "Successfully got device address: %d", device_address);
         } else {
-            // Not synced yet
-            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGE(TAG, "Invalid address response format: %s", response);
+            device_address = 0xFF;  // Set to invalid address
         }
+    } else {
+        ESP_LOGE(TAG, "No response received for address query");
+        device_address = 0xFF;  // Set to invalid address
     }
 }
+
+void calculate_tx_delay(void) {
+    if (device_address == MASTER_ADDRESS) {
+        tx_delay = 0;  // Master device always has 0 delay
+    } else {
+        // Use the correct equation: TX_DELAY = (TX_PERIOD * ADDRESS) / (NUMBER_OF_SLAVES + 1)
+        tx_delay = (TX_PERIOD * device_address) / (NUMBER_OF_SLAVES + 1);
+    }
+    ESP_LOGI(TAG, "Device role: %s, Address: %d, TX_DELAY: %d ms", 
+             (device_address == MASTER_ADDRESS) ? "Master" : "Slave", 
+             device_address, 
+             tx_delay);
+}
+
+void parse_received_data(const char* data, uint8_t* sender_address, uint16_t* msg_number) {
+    char msg_type[10];
+    sscanf(data, "%[^,],%hhu,%hu", msg_type, sender_address, msg_number);
+}
+
+void process_received_message(const char* message) {
+    if (strncmp(message, "+ERR=", 5) == 0) {
+        handle_lora_error(message);
+        return;
+    }
+    
+    uint8_t sender_address;
+    char data[256];
+    int16_t rssi;
+    float snr;
+    
+    sscanf(message, "+RCV=%hhu,%*d,%[^,],%hd,%f", 
+           &sender_address, data, &rssi, &snr);
+    
+    uint16_t received_msg_number;
+    parse_received_data(data, &sender_address, &received_msg_number);
+    
+    if (device_stats[sender_address].last_message_number > 0) {
+        uint16_t expected_msg_number = device_stats[sender_address].last_message_number + 1;
+        if (received_msg_number > expected_msg_number) {
+            uint16_t lost_messages = received_msg_number - expected_msg_number;
+            device_stats[sender_address].messages_lost += lost_messages;
+            total_messages_lost += lost_messages;
+        }
+    }
+    
+    device_stats[sender_address].messages_received++;
+    device_stats[sender_address].last_message_number = received_msg_number;
+    total_messages_received++;
+    
+    ESP_LOGI(TAG, "Received from %d: %s (RSSI: %d, SNR: %.2f)", 
+             sender_address, data, rssi, snr);
+           
+    if ((total_messages_received + total_messages_lost) % STATS_REPORT_INTERVAL == 0) {
+        print_statistics();
+    }
+}
+
+void print_statistics(void) {
+    ESP_LOGI(TAG, "=== Statistics Report ===");
+    ESP_LOGI(TAG, "Messages per device:");
+    
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (device_stats[i].messages_received > 0) {
+            ESP_LOGI(TAG, "Device %d: Received: %u, Lost: %u",
+                     i,
+                     device_stats[i].messages_received,
+                     device_stats[i].messages_lost);
+        }
+    }
+    
+    uint16_t total_messages = total_messages_received + total_messages_lost;
+    float drop_percentage = (total_messages > 0) ?
+        (100.0f * total_messages_lost) / total_messages : 0;
+    
+    ESP_LOGI(TAG, "Total Statistics:");
+    ESP_LOGI(TAG, "Total Messages Received: %u", total_messages_received);
+    ESP_LOGI(TAG, "Total Messages Lost: %u", total_messages_lost);
+    ESP_LOGI(TAG, "Total Messages: %u", total_messages);
+    ESP_LOGI(TAG, "Drop Percentage: %.2f%%", drop_percentage);
+}
+
 
 void app_main(void) {
-    ESP_LOGI(TAG, "==================================================");
-
-    ESP_LOGI(TAG, "Initializing the UART");
     uart_init();
-    ESP_LOGI(TAG, "UART Initialized");
-
-    ESP_LOGI(TAG, "Getting local LoRa device address");
-    get_lora_device_address();
-    ESP_LOGI(TAG, "Local LoRa Device Address: %s", local_lora_device_address);
-
-    // Convert address to number (this becomes our device ID)
-    device_number = atoi(local_lora_device_address);
-    ESP_LOGI(TAG, "Device ID number: %d", device_number);
-
-    // Get UID with retry logic
-    ESP_LOGI(TAG, "Getting UID from the local LoRa device");
-    int retries = 3;
-    while (retries > 0) {
-        get_uid_from_lora();
-        if (strlen(lora_uid) > 0) {
-            break;
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Initial delay for LoRa module
+    
+    get_device_address();
+    calculate_tx_delay();
+    
+    memset(device_stats, 0, sizeof(device_stats));
+    
+    char rx_buffer[BUF_SIZE];
+    bool waiting_for_ok = false;
+    
+    while (1) {
+        if (device_address == MASTER_ADDRESS) {  // Master device
+            // Send sync message
+            char message[256];
+            char payload[64];
+            
+            snprintf(payload, sizeof(payload), "SYNC,%d,%u", device_address, message_number++);
+            int payload_len = strlen(payload);
+            snprintf(message, sizeof(message), "AT+SEND=0,%d,%s", payload_len, payload);
+            
+            send_message(message);
+            ESP_LOGI(TAG, "Master sent SYNC message. Waiting for responses...");
+            
+            // Check for responses during TX_PERIOD
+            uint32_t start_time = pdTICKS_TO_MS(xTaskGetTickCount());
+            while (pdTICKS_TO_MS(xTaskGetTickCount()) - start_time < TX_PERIOD) {
+                int len = uart_read_bytes(UART_PORT, (uint8_t*)rx_buffer, 
+                                        BUF_SIZE, pdMS_TO_TICKS(10));
+                if (len > 0) {
+                    rx_buffer[len] = 0;
+                    ESP_LOGI(TAG, "Master raw data received (%d bytes): %s", len, rx_buffer);
+                    
+                    if (strncmp(rx_buffer, "+ERR=", 5) == 0) {
+                        handle_lora_error(rx_buffer);
+                    } else if (strncmp(rx_buffer, "+RCV=", 5) == 0) {
+                        process_received_message(rx_buffer);
+                    } else if (strncmp(rx_buffer, "+OK", 3) == 0) {
+                        ESP_LOGI(TAG, "Master Send completed successfully");
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            
+        } else {  // Slave device
+            // Check for received messages
+            int len = uart_read_bytes(UART_PORT, (uint8_t*)rx_buffer, 
+                                    BUF_SIZE, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                rx_buffer[len] = 0;
+                ESP_LOGI(TAG, "Slave received: %s", rx_buffer);
+                
+                if (strncmp(rx_buffer, "+ERR=", 5) == 0) {
+                    handle_lora_error(rx_buffer);
+                    waiting_for_ok = false;
+                } else if (strncmp(rx_buffer, "+RCV=", 5) == 0) {
+                    process_received_message(rx_buffer);
+                    
+                    if (!waiting_for_ok) {
+                        vTaskDelay(pdMS_TO_TICKS(tx_delay));
+                        
+                        // Prepare hello message
+                        char message[256];
+                        char payload[64];
+                        
+                        snprintf(payload, sizeof(payload), "HELLO,%d,%u", device_address, message_number++);
+                        int payload_len = strlen(payload);
+                        snprintf(message, sizeof(message), "AT+SEND=0,%d,%s", payload_len, payload);
+                        
+                        send_message(message);
+                        ESP_LOGI(TAG, "Sent hello message from slave. Payload length: %d", payload_len);
+                        waiting_for_ok = true;
+                    }
+                } else if (strncmp(rx_buffer, "+OK", 3) == 0) {
+                    ESP_LOGI(TAG, "Send completed successfully");
+                    waiting_for_ok = false;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));  // Prevent watchdog timeout
         }
-        retries--;
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-    ESP_LOGI(TAG, "Local LoRa Device UID: %s", lora_uid);
-
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    ESP_LOGI(TAG, "Starting Rx and Tx tasks");
-    xTaskCreate(uart_rx_task, "uart_rx_task", TASK_STACK_SIZE, NULL, 5, NULL);
-    xTaskCreate(uart_tx_task, "uart_tx_task", TASK_STACK_SIZE, NULL, 4, NULL);
-
-    ESP_LOGI(TAG, "Tasks started");
-    ESP_LOGI(TAG, "==================================================");
-    vTaskDelay(pdMS_TO_TICKS(2000));
 }
