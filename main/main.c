@@ -49,7 +49,7 @@ typedef struct {
     const char* description;
 } LoRaError;
 
-// Error code to description mapping
+// Error code to description mapping for REYAX LoRa devices RYLR998 and RYLR498
 static const LoRaError LORA_ERRORS[] = {
     {1, "No CR/LF (0x0D 0x0A) at end of AT Command"},
     {2, "AT command header missing"},
@@ -170,7 +170,6 @@ void process_received_message(const char* message) {
 
     uint8_t sender_address;
     int msg_length;
-    char msg_content[256];
     int16_t rssi;
     float snr;
     
